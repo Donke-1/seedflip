@@ -1,0 +1,25 @@
+# Keep the docker build context small.
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+data/
+*.db
+wallet.json
+.git/
+.gitignore
+.idea/
+.vscode/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+tests/
+node_modules/
+frontend/node_modules/
+frontend/dist/
+# We DO want to ship `dist/` (built frontend) into the image, so do NOT ignore
+# top-level dist/.

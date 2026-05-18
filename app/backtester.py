@@ -17,18 +17,15 @@ from __future__ import annotations
 import heapq
 import json
 from dataclasses import dataclass, field
-from typing import Iterable
 
 import numpy as np
 
-from .config import settings
 from .simulator import (
-    ArrivalParams,
     StrategyOutcomeParams,
+    params_to_dict,
     sample_s1_outcome,
     sample_s2_outcome,
     sample_s3_outcome,
-    params_to_dict,
 )
 
 
@@ -157,7 +154,6 @@ def _run_one_sim(params: BacktestParams, rng: np.random.Generator,
 
     trajectory: list[tuple[int, float]] = [(0, bankroll)]
     last_traj_min = 0
-    halted_reason = ""
     trades_log: list[dict] = []
 
     def _close_due(now_min: float) -> None:
@@ -196,14 +192,13 @@ def _run_one_sim(params: BacktestParams, rng: np.random.Generator,
 
         # Halt: bankroll dusted.
         if bankroll <= params.dust_floor_usd and not open_heap:
-            halted_reason = "dust"
+            # Bankroll dusted with no open positions; nothing left to play.
             break
 
         # Halt: daily loss cutoff (only checks at event times).
         equity_now = bankroll + sum(loc for _, _, loc, _ in open_heap)
         if bankroll_day_start > 0 and equity_now < bankroll_day_start * (1 - params.daily_loss_cutoff_pct):
-            halted_reason = "daily_loss"
-            # Skip trading for the rest of this day.
+            # Skip trading for the rest of this day (daily loss cutoff hit).
             continue
 
         if bankroll < params.dust_floor_usd:

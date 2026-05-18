@@ -100,9 +100,11 @@ class WalletStatusOut(BaseModel):
     address: str
     sol_balance: float
     usdc_balance: float
+    usdt_balance: float = 0.0
     funded: bool  # True once usdc_balance >= 1.0 and sol_balance >= 0.01
     armed_env: bool
     rpc_url: str
+    warning: Optional[str] = None  # populated when USDT > 0 (wrong stablecoin sent)
 
 
 class TestSwapIn(BaseModel):
@@ -120,4 +122,27 @@ class TestSwapOut(BaseModel):
     input_usdc: float
     output_usdc: Optional[float] = None
     round_trip_cost_pct: Optional[float] = None
+    error: Optional[str] = None
+
+
+class WithdrawOnchainIn(BaseModel):
+    confirmation_token: str
+    destination_address: str = Field(min_length=32, max_length=64,
+                                     description="Solana wallet address (base58) to send USDC + leftover SOL to.")
+    include_sol_dust: bool = Field(default=True,
+                                   description="If true, also sweep leftover SOL beyond the rent-exempt reserve.")
+    acknowledge_text: str = Field(
+        ..., min_length=10,
+        description='Type "I AGREE TO WITHDRAW" to confirm.',
+    )
+
+
+class WithdrawOnchainOut(BaseModel):
+    ok: bool
+    usdc_txid: Optional[str] = None
+    usdc_confirmed: bool = False
+    usdc_amount: float = 0.0
+    sol_txid: Optional[str] = None
+    sol_confirmed: bool = False
+    sol_amount: float = 0.0
     error: Optional[str] = None

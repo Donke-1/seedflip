@@ -2,11 +2,11 @@
 DB work in a threadpool which is fine at this scale (single-user dashboard)."""
 from __future__ import annotations
 
-from pathlib import Path
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterator
 
-from sqlmodel import SQLModel, Session, create_engine
+from sqlmodel import Session, SQLModel, create_engine
 
 from .config import settings
 

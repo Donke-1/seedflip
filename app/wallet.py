@@ -20,14 +20,33 @@ from typing import Optional
 
 import base58
 import httpx
+from solders.compute_budget import set_compute_unit_price
+from solders.hash import Hash
 from solders.keypair import Keypair
+from solders.message import MessageV0
 from solders.pubkey import Pubkey
+from solders.system_program import TransferParams as SysTransferParams
+from solders.system_program import transfer as sys_transfer
+from solders.transaction import VersionedTransaction
+from spl.token.constants import TOKEN_PROGRAM_ID
+from spl.token.instructions import (
+    TransferCheckedParams,
+    create_associated_token_account,
+    get_associated_token_address,
+    transfer_checked,
+)
 
 log = logging.getLogger(__name__)
 
 
+# Minimum SOL to keep in the wallet after a withdraw, to stay rent-exempt and
+# leave enough lamports for one or two more transactions (fees + closing ATAs).
+WITHDRAW_SOL_RESERVE: float = 0.003
+
+
 # Well-known SPL mints on Solana mainnet.
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 SOL_MINT = "So11111111111111111111111111111111111111112"  # WSOL
 
 
@@ -129,12 +148,55 @@ class WalletManager:
                 continue
         return total
 
+    async def get_token_decimals(self, mint: str) -> int:
+        """Return the SPL token mint's decimals. Cached after first lookup."""
+        cache = getattr(self, "_decimals_cache", None)
+        if cache is None:
+            cache = {}
+            self._decimals_cache = cache
+        if mint in cache:
+            return cache[mint]
+        # Hard-code well-known mints to save an RPC call (USDC/USDT/SOL = 6/6/9).
+        hard_coded = {USDC_MINT: 6, USDT_MINT: 6, SOL_MINT: 9}
+        if mint in hard_coded:
+            cache[mint] = hard_coded[mint]
+            return cache[mint]
+        result = await self._rpc("getTokenSupply", [mint])
+        decimals = int((result.get("value") or {}).get("decimals") or 6)
+        cache[mint] = decimals
+        return decimals
+
+    async def get_spl_token_amount_raw(self, mint: str) -> int:
+        """SPL token balance in smallest units (no decimals applied)."""
+        result = await self._rpc(
+            "getTokenAccountsByOwner",
+            [self.pubkey_str(), {"mint": mint}, {"encoding": "jsonParsed"}],
+        )
+        accounts = result.get("value", [])
+        total = 0
+        for acc in accounts:
+            try:
+                amt = acc["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]
+                total += int(amt)
+            except (KeyError, TypeError, ValueError):
+                continue
+        return total
+
+    async def has_token_account(self, owner: str, mint: str) -> bool:
+        """Cheaper than full balance query: does the owner have an ATA for this mint?"""
+        result = await self._rpc(
+            "getTokenAccountsByOwner",
+            [owner, {"mint": mint}, {"encoding": "jsonParsed"}],
+        )
+        return bool(result.get("value"))
+
     async def get_balances(self) -> dict:
-        sol, usdc = await asyncio.gather(
+        sol, usdc, usdt = await asyncio.gather(
             self.get_sol_balance(),
             self.get_spl_token_balance(USDC_MINT),
+            self.get_spl_token_balance(USDT_MINT),
         )
-        return {"sol": sol, "usdc": usdc, "address": self.pubkey_str()}
+        return {"sol": sol, "usdc": usdc, "usdt": usdt, "address": self.pubkey_str()}
 
     async def send_signed_b64_tx(self, b64_tx: str) -> str:
         """Send a fully-signed serialized transaction (base64) to the RPC.
@@ -170,6 +232,107 @@ class WalletManager:
             await asyncio.sleep(1.0)
         log.warning("tx %s did not confirm within %.0fs", txid, max_wait_s)
         return False
+
+    async def _get_recent_blockhash(self) -> Hash:
+        result = await self._rpc("getLatestBlockhash", [{"commitment": "finalized"}])
+        bh = (result.get("value") or {}).get("blockhash")
+        if not bh:
+            raise RuntimeError("getLatestBlockhash returned no blockhash")
+        return Hash.from_string(bh)
+
+    async def transfer_spl_to(
+        self,
+        mint: str,
+        destination_owner: str,
+        amount_smallest_units: int,
+        priority_fee_micro_lamports: int = 5_000,
+    ) -> tuple[str, bool]:
+        """Send `amount_smallest_units` of `mint` to the wallet `destination_owner`.
+
+        Auto-creates the destination's associated token account if missing
+        (the sender pays the ~0.002 SOL rent).
+
+        Returns (txid, confirmed).
+        """
+        if amount_smallest_units <= 0:
+            raise ValueError("amount must be > 0")
+
+        kp = self.load_or_create()
+        sender = kp.pubkey()
+        dest_owner_pk = Pubkey.from_string(destination_owner)
+        mint_pk = Pubkey.from_string(mint)
+
+        src_ata = get_associated_token_address(sender, mint_pk)
+        dst_ata = get_associated_token_address(dest_owner_pk, mint_pk)
+
+        decimals = await self.get_token_decimals(mint)
+        instructions = [
+            set_compute_unit_price(priority_fee_micro_lamports),
+        ]
+        if not await self.has_token_account(destination_owner, mint):
+            log.info("Destination ATA missing for %s; including create instruction", destination_owner)
+            instructions.append(
+                create_associated_token_account(payer=sender, owner=dest_owner_pk, mint=mint_pk)
+            )
+        instructions.append(
+            transfer_checked(
+                TransferCheckedParams(
+                    program_id=TOKEN_PROGRAM_ID,
+                    source=src_ata,
+                    mint=mint_pk,
+                    dest=dst_ata,
+                    owner=sender,
+                    amount=amount_smallest_units,
+                    decimals=decimals,
+                    signers=[],
+                )
+            )
+        )
+
+        blockhash = await self._get_recent_blockhash()
+        msg = MessageV0.try_compile(
+            payer=sender,
+            instructions=instructions,
+            address_lookup_table_accounts=[],
+            recent_blockhash=blockhash,
+        )
+        tx = VersionedTransaction(msg, [kp])
+        b64 = base64.b64encode(bytes(tx)).decode("ascii")
+        txid = await self.send_signed_b64_tx(b64)
+        confirmed = await self.confirm_transaction(txid, max_wait_s=90.0)
+        return txid, confirmed
+
+    async def transfer_sol_to(
+        self,
+        destination_owner: str,
+        lamports: int,
+        priority_fee_micro_lamports: int = 5_000,
+    ) -> tuple[str, bool]:
+        """Native SOL transfer to a system-account destination.
+
+        Returns (txid, confirmed).
+        """
+        if lamports <= 0:
+            raise ValueError("lamports must be > 0")
+        kp = self.load_or_create()
+        sender = kp.pubkey()
+        dest_pk = Pubkey.from_string(destination_owner)
+        instructions = [
+            set_compute_unit_price(priority_fee_micro_lamports),
+            sys_transfer(SysTransferParams(from_pubkey=sender, to_pubkey=dest_pk, lamports=lamports)),
+        ]
+        blockhash = await self._get_recent_blockhash()
+        msg = MessageV0.try_compile(
+            payer=sender,
+            instructions=instructions,
+            address_lookup_table_accounts=[],
+            recent_blockhash=blockhash,
+        )
+        tx = VersionedTransaction(msg, [kp])
+        b64 = base64.b64encode(bytes(tx)).decode("ascii")
+        txid = await self.send_signed_b64_tx(b64)
+        confirmed = await self.confirm_transaction(txid, max_wait_s=90.0)
+        return txid, confirmed
 
     async def aclose(self) -> None:
         await self._http.aclose()

@@ -10,11 +10,10 @@ Live mode:
 - HARD GATED. The runner refuses to enter live mode unless:
     1) settings.live_trading_armed is True (env var) AND
     2) BotState.mode == "live" (only switchable via /control/go-live POST with a confirmation token).
-- Even when both are set, this v1 of the runner DOES NOT submit on-chain transactions.
-  The Solana swap signing integration is intentionally deferred until after
-  the backtest is approved by the user. This is the safe default. Until that
-  integration ships, live mode behaves like paper mode but is labelled "live"
-  so the user can dry-run their entire deposit/withdraw/monitoring UX.
+- When both are set, entries call Jupiter to actually submit USDC -> SPL token
+  swaps signed by the on-disk keypair. Exits do the reverse. If a swap fails
+  to confirm we skip the trade and keep bankroll intact — no synthetic
+  position is recorded. All real txids are persisted on the Trade row.
 """
 from __future__ import annotations
 
@@ -22,14 +21,16 @@ import asyncio
 import logging
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlmodel import select
 
+from . import wallet as wallet_mod
 from .config import settings
 from .data_sources import DexScreenerClient, TokenSnapshot
 from .db import session_scope
+from .jupiter import JupiterClient
 from .models import BotState, EquitySnapshot, Trade
 from .strategies import MajorsScalpS3, MigrationSniperS2, MomentumSniperS1
 from .strategies.base import Position
@@ -194,6 +195,14 @@ class Runner:
                 equity += p.size_usd * mult
         return equity
 
+    def _is_live(self, state: BotState) -> bool:
+        """Real Jupiter trading requires BOTH the env arming flag AND state.mode."""
+        return bool(
+            state.mode == "live"
+            and settings.live_trading_armed
+            and wallet_mod.WALLET is not None
+        )
+
     async def _maybe_close_positions(self, session, snaps: dict[str, TokenSnapshot], state: BotState) -> None:
         # Ask each strategy for exits.
         exits_s1 = self.s1.consider_exits(self._open_positions, snaps, self._tick)
@@ -203,21 +212,32 @@ class Runner:
         if not all_exits:
             return
 
+        live = self._is_live(state)
         to_remove: set[int] = set()
         for pos, reason in all_exits:
             snap = snaps.get(pos.address)
             exit_price = snap.price_usd if snap else pos.entry_price
-            mult = (exit_price / pos.entry_price) if pos.entry_price > 0 else 1.0
-            proceeds = pos.size_usd * mult
-            pnl = proceeds - pos.size_usd
+
+            if live and pos.token_units > 0:
+                proceeds, exit_txid, confirmed = await self._execute_close_live(pos)
+                if not confirmed:
+                    # On-chain sell failed (rate limit, no route, slippage too big).
+                    # Leave the position open and retry next tick. Do NOT realize a
+                    # synthetic exit because we still hold the tokens.
+                    log.warning(
+                        "live sell failed for %s (%s); will retry next tick",
+                        pos.symbol, pos.address,
+                    )
+                    continue
+                pos.exit_txid = exit_txid
+                pnl = proceeds - pos.size_usd
+                mult = (proceeds / pos.size_usd) if pos.size_usd > 0 else 1.0
+            else:
+                mult = (exit_price / pos.entry_price) if pos.entry_price > 0 else 1.0
+                proceeds = pos.size_usd * mult
+                pnl = proceeds - pos.size_usd
+
             state.bankroll_usd += proceeds
-            # Persist closed Trade.
-            t = (
-                session.exec(
-                    select(Trade).where(Trade.symbol == pos.symbol, Trade.opened_at == datetime.fromtimestamp(0, tz=timezone.utc)).limit(1)
-                ).first()
-            )
-            # Easier: just create a finalized Trade row directly (we don't track open trades by id in this in-memory list).
             session.add(Trade(
                 opened_at=_utcnow() - timedelta(minutes=max(0, self._tick - pos.opened_at_tick)),
                 closed_at=_utcnow(),
@@ -231,9 +251,29 @@ class Runner:
                 pnl_pct=(mult - 1.0),
                 exit_reason=reason,
                 mode=state.mode,
+                run_id=pos.entry_txid or None,
             ))
             to_remove.add(id(pos))
         self._open_positions = [p for p in self._open_positions if id(p) not in to_remove]
+
+    async def _execute_close_live(self, pos: Position) -> tuple[float, str, bool]:
+        """Sell `pos.token_units` of `pos.address` for USDC via Jupiter.
+
+        Returns (proceeds_usd, txid, confirmed). On failure proceeds=0.
+        """
+        assert wallet_mod.WALLET is not None  # narrowed by _is_live
+        jup = JupiterClient(wallet_mod.WALLET)
+        try:
+            res = await jup.sell_token_to_usdc(pos.address, pos.token_units)
+        except Exception:  # noqa: BLE001 — Jupiter quote / RPC may fail; treat as a missed exit
+            log.exception("Jupiter sell failed for %s", pos.symbol)
+            return 0.0, "", False
+        finally:
+            await jup.aclose()
+        if not res.confirmed:
+            return 0.0, res.txid or "", False
+        proceeds_usd = res.output_amount / 1_000_000  # USDC has 6 decimals
+        return proceeds_usd, res.txid, True
 
     async def _maybe_open_positions(
         self, session, memes: list[TokenSnapshot], majors: list[TokenSnapshot],
@@ -248,10 +288,11 @@ class Runner:
         for p in self._open_positions:
             deployed_by_strat[p.strategy] += p.size_usd
 
-        # S1 entries
         candidates_s1 = self.s1.consider_entries(memes, self._open_positions, state.bankroll_usd)
         candidates_s2 = self.s2.consider_entries(memes, self._open_positions, state.bankroll_usd)
         candidates_s3 = self.s3.consider_entries(majors, self._open_positions, state.bankroll_usd)
+
+        live = self._is_live(state)
 
         for strat_name, strat, candidates, alloc, trade_pct, tp_mult, sl_pct in [
             ("S1", self.s1, candidates_s1, bp.alloc_s1, bp.s1_trade_pct, bp.outcomes.s1.tp_mid, 0.40),
@@ -269,18 +310,67 @@ class Runner:
                 per_trade = min(state.bankroll_usd * size_pct, state.bankroll_usd * bp.max_trade_pct, cap_for_strat)
                 if per_trade < 0.10:
                     continue
-                state.bankroll_usd -= per_trade
-                deployed_by_strat[strat_name] += per_trade
+
+                token_units = 0
+                entry_txid = ""
+                effective_entry_price = snap.price_usd
+                effective_size_usd = per_trade
+
+                if live:
+                    res = await self._execute_open_live(snap.address, per_trade)
+                    if res is None:
+                        # Swap didn't confirm — bankroll untouched, skip.
+                        continue
+                    token_units = res["token_units"]
+                    entry_txid = res["txid"]
+                    effective_size_usd = res["spent_usdc"]
+                    # Derive an on-chain effective entry price (USDC per token).
+                    if token_units > 0:
+                        try:
+                            decimals = await wallet_mod.WALLET.get_token_decimals(snap.address)  # type: ignore[union-attr]
+                            tokens_whole = token_units / (10 ** decimals)
+                            if tokens_whole > 0:
+                                effective_entry_price = effective_size_usd / tokens_whole
+                        except Exception:  # noqa: BLE001
+                            log.warning("Could not derive entry price for %s, falling back to feed", snap.symbol)
+
+                state.bankroll_usd -= effective_size_usd
+                deployed_by_strat[strat_name] += effective_size_usd
                 pos = Position(
-                    symbol=snap.symbol, address=snap.address, entry_price=snap.price_usd,
-                    size_usd=per_trade, opened_at_tick=self._tick, strategy=strat_name,
+                    symbol=snap.symbol, address=snap.address, entry_price=effective_entry_price,
+                    size_usd=effective_size_usd, opened_at_tick=self._tick, strategy=strat_name,
                     take_profit_mult=tp_mult, stop_loss_pct=sl_pct,
+                    token_units=token_units, entry_txid=entry_txid,
                 )
                 self._open_positions.append(pos)
                 session.add(Trade(
                     strategy=strat_name, symbol=snap.symbol, side="long",
-                    size_usd=per_trade, entry_price=snap.price_usd, mode=state.mode,
+                    size_usd=effective_size_usd, entry_price=effective_entry_price, mode=state.mode,
+                    run_id=entry_txid or None,
                 ))
+
+    async def _execute_open_live(self, mint: str, usd_amount: float) -> Optional[dict]:
+        """Buy `mint` with `usd_amount` USDC via Jupiter. Returns None if swap fails.
+
+        Returns dict with keys: token_units (int), txid (str), spent_usdc (float)
+        """
+        assert wallet_mod.WALLET is not None  # _is_live narrowed
+        usdc_units = int(round(usd_amount * 1_000_000))
+        if usdc_units <= 0:
+            return None
+        jup = JupiterClient(wallet_mod.WALLET)
+        try:
+            res = await jup.buy_usdc_to_token(mint, usdc_units)
+        except Exception:  # noqa: BLE001
+            log.exception("Jupiter buy failed for %s", mint)
+            return None
+        finally:
+            await jup.aclose()
+        if not res.confirmed or res.output_amount <= 0:
+            log.warning("buy unconfirmed for %s txid=%s", mint, res.txid)
+            return None
+        spent_usdc = res.input_amount / 1_000_000
+        return {"token_units": int(res.output_amount), "txid": res.txid, "spent_usdc": spent_usdc}
 
     # ---- introspection used by API -----------------------------------------
 

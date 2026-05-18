@@ -12,7 +12,8 @@ sensitive the final return distribution is to these assumptions.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
+
 import numpy as np
 
 
