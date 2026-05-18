@@ -20,6 +20,24 @@ solders = "^0.27.1"
 base58 = "^2.1.1"
 
 
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.3"
+pytest-asyncio = "^1.3.0"
+ruff = "^0.15.13"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+# E702 (semicolons grouping struct-like field defaults) is a deliberate stylistic
+# choice in the simulator/strategy_config; allow it project-wide.
+ignore = ["E702", "E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

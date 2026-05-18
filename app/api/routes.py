@@ -1,35 +1,34 @@
 """HTTP endpoints."""
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import Session, select, desc
+from sqlmodel import Session, desc, select
 
 from .. import runner as runner_mod
 from .. import wallet as wallet_mod
 from ..backtester import BacktestParams, run_backtest, summary_to_jsonable
 from ..config import settings
-from ..db import get_session
+from ..db import get_session, session_scope
 from ..jupiter import JupiterClient
 from ..models import BacktestRun, BotState, EquitySnapshot, Trade
-from ..strategy_config import params_summary_dict, BACKTEST_HEADLINE_STATS
+from ..strategy_config import BACKTEST_HEADLINE_STATS, params_summary_dict
 from .schemas import (
     BacktestIn,
     BacktestRunSummaryOut,
     DepositIn,
-    EquityPoint,
     GoLiveIn,
     StateOut,
     TestSwapIn,
     TestSwapOut,
-    TradeOut,
     WalletStatusOut,
     WithdrawIn,
+    WithdrawOnchainIn,
+    WithdrawOnchainOut,
 )
 
 log = logging.getLogger(__name__)
@@ -235,23 +234,33 @@ async def get_wallet() -> WalletStatusOut:
         raise HTTPException(status_code=503, detail="Wallet not initialized")
     try:
         balances = await wallet_mod.WALLET.get_balances()
-    except Exception as e:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         # RPC may be rate-limited; still surface the address.
         return WalletStatusOut(
             address=wallet_mod.WALLET.pubkey_str(),
             sol_balance=-1.0,
             usdc_balance=-1.0,
+            usdt_balance=-1.0,
             funded=False,
             armed_env=settings.live_trading_armed,
             rpc_url=settings.solana_rpc_url,
+            warning="RPC unavailable; balances unknown.",
+        )
+    warning: Optional[str] = None
+    if balances["usdt"] > 0.0:
+        warning = (
+            f"You have {balances['usdt']:.2f} USDT but the bot only trades USDC. "
+            "Swap your USDT to USDC at https://jup.ag (or send USDC instead)."
         )
     return WalletStatusOut(
         address=balances["address"],
         sol_balance=balances["sol"],
         usdc_balance=balances["usdc"],
+        usdt_balance=balances["usdt"],
         funded=(balances["sol"] >= 0.01 and balances["usdc"] >= 1.0),
         armed_env=settings.live_trading_armed,
         rpc_url=settings.solana_rpc_url,
+        warning=warning,
     )
 
 
@@ -296,6 +305,89 @@ async def control_test_swap(payload: TestSwapIn) -> TestSwapOut:
         output_usdc=output_usdc,
         round_trip_cost_pct=cost_pct,
     )
+
+
+@router.post("/control/withdraw-onchain", response_model=WithdrawOnchainOut)
+async def control_withdraw_onchain(payload: WithdrawOnchainIn) -> WithdrawOnchainOut:
+    """Sweep wallet USDC (and optionally leftover SOL beyond rent reserve) to a Solana address.
+
+    Hard requirements:
+    - LIVE_TRADING_ARMED env must be true.
+    - confirmation_token must match the boot token.
+    - acknowledge_text must literally be "I AGREE TO WITHDRAW".
+    - The runner must be HALTED first so no new trades open mid-sweep.
+    """
+    if not settings.live_trading_armed:
+        raise HTTPException(status_code=403, detail="Live trading not armed (env LIVE_TRADING_ARMED must be true)")
+    if not runner_mod.RUNNER:
+        raise HTTPException(status_code=503, detail="Runner not started")
+    if payload.confirmation_token != runner_mod.RUNNER.go_live_token:
+        raise HTTPException(status_code=403, detail="Bad confirmation token")
+    if payload.acknowledge_text.strip().upper() != "I AGREE TO WITHDRAW":
+        raise HTTPException(status_code=400, detail='acknowledge_text must be "I AGREE TO WITHDRAW"')
+    if wallet_mod.WALLET is None:
+        raise HTTPException(status_code=503, detail="Wallet not initialized")
+
+    # Refuse to sweep while live trading is running — bot could open positions
+    # mid-sweep and front-run our balance read. Operator must halt first.
+    with session_scope() as session:
+        state = _state_or_init(session)
+        if state.mode == "live":
+            raise HTTPException(
+                status_code=400,
+                detail="Refusing to withdraw while bot is in live mode. POST /api/control/halt first.",
+            )
+
+    wallet = wallet_mod.WALLET
+    out = WithdrawOnchainOut(ok=False)
+
+    # 1. Sweep all USDC.
+    try:
+        usdc_units = await wallet.get_spl_token_amount_raw(wallet_mod.USDC_MINT)
+    except Exception as e:  # noqa: BLE001
+        return WithdrawOnchainOut(ok=False, error=f"failed to read USDC balance: {e}")
+
+    if usdc_units > 0:
+        try:
+            txid, confirmed = await wallet.transfer_spl_to(
+                wallet_mod.USDC_MINT, payload.destination_address, usdc_units,
+            )
+            out.usdc_txid = txid
+            out.usdc_confirmed = confirmed
+            out.usdc_amount = usdc_units / 1_000_000
+        except Exception as e:  # noqa: BLE001
+            log.exception("USDC sweep failed")
+            return WithdrawOnchainOut(ok=False, error=f"USDC sweep failed: {e}")
+
+    # 2. Optionally sweep leftover SOL beyond rent reserve.
+    if payload.include_sol_dust:
+        try:
+            sol_balance = await wallet.get_sol_balance()
+        except Exception as e:  # noqa: BLE001
+            return WithdrawOnchainOut(
+                ok=(out.usdc_confirmed or usdc_units == 0),
+                usdc_txid=out.usdc_txid, usdc_confirmed=out.usdc_confirmed, usdc_amount=out.usdc_amount,
+                error=f"failed to read SOL balance: {e}",
+            )
+        sweepable = max(0.0, sol_balance - wallet_mod.WITHDRAW_SOL_RESERVE)
+        # Need at least one tx fee worth of dust to bother (~0.000005 SOL).
+        if sweepable >= 0.0005:
+            lamports = int(sweepable * 1_000_000_000)
+            try:
+                sol_txid, sol_confirmed = await wallet.transfer_sol_to(
+                    payload.destination_address, lamports,
+                )
+                out.sol_txid = sol_txid
+                out.sol_confirmed = sol_confirmed
+                out.sol_amount = sweepable
+            except Exception as e:  # noqa: BLE001
+                log.exception("SOL sweep failed (USDC already swept)")
+                out.error = f"SOL sweep failed after USDC: {e}"
+
+    out.ok = (out.usdc_confirmed or usdc_units == 0) and (
+        out.sol_confirmed or out.sol_amount == 0.0
+    )
+    return out
 
 
 # ----- backtest ---------------------------------------------------------------

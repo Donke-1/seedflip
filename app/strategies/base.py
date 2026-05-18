@@ -19,6 +19,13 @@ class Position:
     take_profit_mult: float = 2.0
     stop_loss_pct: float = 0.4
     max_age_ticks: int = 60 * 6  # 6 hours at 1-min ticks
+    # Smallest-units of the SPL token actually held on-chain. Only set in
+    # live mode after a confirmed Jupiter buy; in paper mode this stays 0
+    # and the position is purely synthetic.
+    token_units: int = 0
+    # Optional Solana tx signatures for audit. Useful for the UI / withdraw flow.
+    entry_txid: str = ""
+    exit_txid: str = ""
 
 
 @dataclass

@@ -21,7 +21,7 @@ import httpx
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
-from .wallet import USDC_MINT, SOL_MINT, WalletManager
+from .wallet import SOL_MINT, USDC_MINT, WalletManager
 
 log = logging.getLogger(__name__)
 

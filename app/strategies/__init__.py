@@ -9,8 +9,8 @@ threads positions through them.
 """
 
 from .base import Position, Strategy, StrategyDecision
-from .momentum import MomentumSniperS1
 from .migration import MigrationSniperS2
+from .momentum import MomentumSniperS1
 from .scalp import MajorsScalpS3
 
 __all__ = [

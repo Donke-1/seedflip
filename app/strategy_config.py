@@ -9,7 +9,6 @@ To re-tune: run /backtest/run with custom params from the dashboard.
 """
 from __future__ import annotations
 
-from dataclasses import asdict
 import json
 
 from .backtester import BacktestParams
