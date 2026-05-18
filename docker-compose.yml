@@ -1,0 +1,35 @@
+# SeedFlip docker-compose.
+#
+# Usage:
+#   1. Place the prebuilt frontend bundle at ./dist (or run scripts/build_frontend.sh)
+#   2. Edit `.env` (see .env.example) so it has:
+#        SOLANA_RPC_URL=https://api.mainnet-beta.solana.com   # or a Helius / QuickNode key
+#        LIVE_TRADING_ARMED=true                              # ONLY after you trust it
+#   3. docker compose up -d
+#   4. Reverse proxy / Caddy / nginx in front of port 8000 to give it a public TLS URL
+#      (alternatively use Railway / Render which give you a URL automatically)
+#   5. Open https://your-host/ and the LiveWalletCard will be reachable
+#
+# Wallet keypair persists to ./data/wallet.json (mode 0600). NEVER commit ./data
+# to git; the .gitignore already excludes it.
+
+services:
+  seedflip:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: seedflip
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Default settings; override via .env
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+      LIVE_TRADING_ARMED: ${LIVE_TRADING_ARMED:-false}
+      WALLET_SECRET_PATH: /data/wallet.json
+      PORT: 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persists wallet keypair + SQLite DB across container restarts.
+      - ./data:/data

@@ -1,0 +1,17 @@
+# Persistent state (wallet keypair + SQLite DB). NEVER commit.
+data/
+*.db
+wallet.json
+
+# Env files with secrets.
+.env
+.env.*
+!.env.example
+
+# Python.
+__pycache__/
+*.pyc
+.venv/
+
+# Built frontend (rebuild on the host).
+dist/
